@@ -36,14 +36,11 @@ async def upload_resume(
     db: AsyncSession = Depends(get_db),
 ):
     """Upload a DOCX resume, parse it, and create/update user profile."""
-    if not file.filename.endswith(".docx"):
+    if not file.filename or not file.filename.lower().endswith(".docx"):
         raise HTTPException(
             status_code=400,
             detail="Only .docx files are supported",
         )
-
-    if file.size and file.size > 10 * 1024 * 1024:  # 10MB limit
-        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
 
     # Save file with UUID name
     file_ext = os.path.splitext(file.filename)[1]
@@ -51,6 +48,8 @@ async def upload_resume(
     file_path = os.path.join(settings.UPLOAD_DIR, safe_filename)
 
     content = await file.read()
+    if len(content) > 10 * 1024 * 1024:  # 10MB limit
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
     with open(file_path, "wb") as f:
         f.write(content)
 
