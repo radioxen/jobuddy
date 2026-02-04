@@ -1,0 +1,76 @@
+search_jobs:
+  description: >
+    Search for jobs matching the following criteria:
+    Job Titles: {job_titles}
+    Locations: {locations}
+    Remote Preference: {remote_preference}
+    Platforms: {platforms}
+    Max Results: {max_results}
+
+    Search each platform and compile a deduplicated list of job listings.
+    For each job, extract: title, company, location, description, salary info,
+    job type, and whether it supports easy apply.
+  expected_output: >
+    A JSON array of job objects with fields: source, source_url, source_job_id,
+    title, company, location, description, salary_info, job_type, posted_date,
+    is_easy_apply.
+
+score_jobs:
+  description: >
+    Given the candidate's resume data and a list of job listings,
+    score each job for fit on a scale of 0-100.
+
+    Resume: {resume_json}
+    Jobs: {jobs_json}
+
+    Consider:
+    - Skills match (do the candidate's skills align with requirements?)
+    - Experience level match
+    - Location compatibility
+    - Industry relevance
+    - Salary alignment (if available)
+
+    Be honest and calibrated. A score of 80+ means excellent match.
+    50-79 means reasonable match. Below 50 means poor match.
+  expected_output: >
+    A JSON array of objects with: job_id, fit_score (0-100),
+    fit_reasoning (2-3 sentences explaining the score).
+
+tailor_resume:
+  description: >
+    Tailor the candidate's resume for a specific job application.
+
+    Resume Data: {resume_json}
+    Job Title: {job_title}
+    Company: {company}
+    Job Description: {job_description}
+
+    Adjust:
+    1. Professional summary to align with job requirements
+    2. Reorder skills to prioritize relevant ones
+    3. Rephrase experience bullets to highlight relevant achievements
+    4. Keep ALL content truthful
+    5. Optimize for ATS keyword matching
+  expected_output: >
+    A JSON object with the tailored resume sections: full_name, email,
+    phone, linkedin_url, summary, skills, experience, education, certifications.
+
+write_cover_letter:
+  description: >
+    Write a cover letter for the candidate applying to a specific job.
+
+    Resume: {resume_json}
+    Job Title: {job_title}
+    Company: {company}
+    Job Description: {job_description}
+
+    The cover letter should:
+    1. Open with a compelling hook
+    2. Connect 2-3 specific experiences to job requirements
+    3. Show knowledge of the company
+    4. Close with enthusiasm and a call to action
+    5. Stay under 400 words
+    6. Sound authentic, not generic
+  expected_output: >
+    The complete cover letter text, starting with the salutation
+    and ending with the sign-off.
