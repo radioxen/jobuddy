@@ -8,19 +8,25 @@ or chat commands.
 
 Pipeline phases:
 1. Job Search — Search Indeed/LinkedIn for matching jobs
-2. Job Scoring — Score each job against the candidate's resume
-3. Document Preparation — Tailor resume + write cover letter per job
+2. Job Scoring — Score each job against the candidate's resume + portfolio (RAG)
+3. Document Preparation — Tailor resume + write cover letter per job (RAG-enhanced)
 4. Form Filling — Fill application forms in browser (Playwright)
+
+Features:
+- RAG integration for better context from resume + portfolio documents
+- Recursive job status tracking through the pipeline
+- Real-time WebSocket updates at each step
 """
 
 import asyncio
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from openai import OpenAI
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from sqlalchemy.orm import joinedload
 
 from app.config import settings
@@ -32,15 +38,123 @@ from app.services.browser_manager import get_browser_manager
 from app.services.cover_letter_writer import CoverLetterWriter
 from app.services.form_filler import get_form_filler
 from app.services.job_search import IndeedSearcher, LinkedInSearcher
+from app.services.rag_service import get_rag_service
 from app.services.resume_tailor import ResumeTailorService
 from app.services.websocket_manager import get_ws_manager
 
+
+# ============================================================================
+# Pipeline Status Tracking
+# ============================================================================
+
+class PipelineTracker:
+    """Tracks job application pipeline status recursively."""
+
+    STATUS_FLOW = {
+        "discovered": "scored",
+        "scored": "approved",
+        "approved": "documents_ready",
+        "documents_ready": "form_filled",
+        "form_filled": "awaiting_review",
+        "awaiting_review": "submitted",
+    }
+
+    TERMINAL_STATES = {"submitted", "skipped", "failed"}
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.ws = get_ws_manager()
+
+    async def get_pipeline_status(self) -> dict:
+        """Get complete pipeline status for all jobs."""
+        async with async_session() as db:
+            result = await db.execute(
+                select(JobListing).where(JobListing.user_id == self.user_id)
+            )
+            jobs = result.scalars().all()
+
+            status_counts = {}
+            for job in jobs:
+                status_counts[job.status] = status_counts.get(job.status, 0) + 1
+
+            # Get applications
+            app_result = await db.execute(
+                select(Application).where(Application.user_id == self.user_id)
+            )
+            apps = app_result.scalars().all()
+            app_status_counts = {}
+            for app in apps:
+                app_status_counts[app.status] = app_status_counts.get(app.status, 0) + 1
+
+            return {
+                "total_jobs": len(jobs),
+                "job_statuses": status_counts,
+                "total_applications": len(apps),
+                "application_statuses": app_status_counts,
+                "next_actions": self._get_next_actions(status_counts, app_status_counts),
+            }
+
+    def _get_next_actions(self, job_status: dict, app_status: dict) -> list[str]:
+        """Determine what actions should be taken next."""
+        actions = []
+
+        if job_status.get("scored", 0) > 0:
+            actions.append(f"Review and approve {job_status['scored']} scored jobs")
+
+        if app_status.get("pending", 0) > 0:
+            actions.append(f"Prepare documents for {app_status['pending']} approved jobs")
+
+        if app_status.get("documents_ready", 0) > 0:
+            actions.append(f"Fill forms for {app_status['documents_ready']} ready applications")
+
+        if app_status.get("form_filled", 0) > 0:
+            actions.append(f"Review and submit {app_status['form_filled']} filled applications")
+
+        return actions
+
+    async def advance_job_status(self, job_id: int, new_status: str):
+        """Advance a job to a new status with validation."""
+        async with async_session() as db:
+            result = await db.execute(
+                select(JobListing).where(JobListing.id == job_id)
+            )
+            job = result.scalar_one_or_none()
+            if not job:
+                return False
+
+            # Validate status transition
+            current = job.status
+            expected_next = self.STATUS_FLOW.get(current)
+
+            if new_status in self.TERMINAL_STATES or new_status == expected_next:
+                job.status = new_status
+                await db.commit()
+                return True
+
+            return False
+
+    async def notify_status(self, message: str, data: dict = None):
+        """Send status update via WebSocket."""
+        await self.ws.send_status(
+            self.user_id,
+            "pipeline_update",
+            {"message": message, "data": data or {}, "timestamp": datetime.now(timezone.utc).isoformat()},
+        )
+
+
+# ============================================================================
+# Notification Helper
+# ============================================================================
 
 async def _notify(user_id: int, message: str, status_type: str = "flow_update"):
     """Send a real-time status update via WebSocket."""
     ws = get_ws_manager()
     await ws.send_status(user_id, status_type, {"message": message})
 
+
+# ============================================================================
+# Phase 1: Job Search
+# ============================================================================
 
 async def run_job_search(
     user_id: int,
@@ -50,18 +164,27 @@ async def run_job_search(
     platforms: list[str] = None,
     max_results: int = 25,
 ):
-    """Phase 1: Search for jobs across platforms and score them.
+    """
+    Phase 1: Search for jobs across platforms and score them.
 
     This function:
-    1. Searches Indeed and/or LinkedIn for jobs
-    2. Saves discovered jobs to the database
-    3. Scores each job against the candidate's resume
-    4. Notifies the user via WebSocket
+    1. Loads RAG context from documents (resume + portfolio)
+    2. Searches Indeed and/or LinkedIn for jobs
+    3. Saves discovered jobs to the database
+    4. Scores each job against the candidate's resume (RAG-enhanced)
+    5. Notifies the user via WebSocket
     """
     if platforms is None:
         platforms = ["indeed", "linkedin"]
 
-    await _notify(user_id, "Starting job search...")
+    tracker = PipelineTracker(user_id)
+    await _notify(user_id, "Starting job search pipeline...")
+
+    # Initialize RAG service and load documents
+    rag = get_rag_service()
+    doc_count = rag.load_documents()
+    if doc_count > 0:
+        await _notify(user_id, f"Loaded {doc_count} documents for RAG context")
 
     bm = get_browser_manager()
     await bm.ensure_initialized()
@@ -89,9 +212,7 @@ async def run_job_search(
                         f"Found {len(indeed_jobs)} jobs on Indeed for '{title}'",
                     )
                 except Exception as e:
-                    await _notify(
-                        user_id, f"Indeed search error: {str(e)}"
-                    )
+                    await _notify(user_id, f"Indeed search error: {str(e)}")
 
             if "linkedin" in platforms:
                 await _notify(
@@ -111,9 +232,7 @@ async def run_job_search(
                         f"Found {len(linkedin_jobs)} jobs on LinkedIn for '{title}'",
                     )
                 except Exception as e:
-                    await _notify(
-                        user_id, f"LinkedIn search error: {str(e)}"
-                    )
+                    await _notify(user_id, f"LinkedIn search error: {str(e)}")
 
     # Deduplicate by title + company
     seen = set()
@@ -154,13 +273,17 @@ async def run_job_search(
         for j in saved_jobs:
             await db.refresh(j)
 
-        # Now score them
-        await _score_jobs(user_id, saved_jobs, db)
+        # Now score them with RAG context
+        await _score_jobs_with_rag(user_id, saved_jobs, db, rag)
+
+    # Report pipeline status
+    status = await tracker.get_pipeline_status()
+    await tracker.notify_status("Job search complete", status)
 
 
-async def _score_jobs(user_id: int, jobs: list[JobListing], db):
-    """Score jobs against the candidate's resume using GPT."""
-    await _notify(user_id, "Scoring jobs against your resume...")
+async def _score_jobs_with_rag(user_id: int, jobs: list[JobListing], db, rag):
+    """Score jobs against the candidate's resume using GPT with RAG context."""
+    await _notify(user_id, "Scoring jobs against your resume and portfolio...")
 
     # Get user resume
     result = await db.execute(
@@ -172,6 +295,12 @@ async def _score_jobs(user_id: int, jobs: list[JobListing], db):
         return
 
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+    # Get portfolio highlights for context
+    portfolio_projects = rag.get_portfolio_highlights()
+    portfolio_context = ""
+    if portfolio_projects:
+        portfolio_context = f"\n\nCandidate's Company Portfolio Projects:\n{json.dumps(portfolio_projects, indent=2)}"
 
     # Score in batches of 5
     batch_size = 5
@@ -188,6 +317,8 @@ async def _score_jobs(user_id: int, jobs: list[JobListing], db):
             for j in batch
         ]
 
+        await _notify(user_id, f"Scoring batch {i//batch_size + 1}/{(len(jobs) + batch_size - 1)//batch_size}...")
+
         try:
             response = client.chat.completions.create(
                 model=settings.OPENAI_MODEL,
@@ -195,9 +326,17 @@ async def _score_jobs(user_id: int, jobs: list[JobListing], db):
                 messages=[
                     {
                         "role": "system",
-                        "content": """You are a resume-job fit scoring expert.
-Score each job for how well it matches the candidate's resume.
-Return JSON: {"scores": [{"id": N, "score": 0-100, "reasoning": "..."}]}
+                        "content": f"""You are a resume-job fit scoring expert with access to the candidate's full background.
+Score each job for how well it matches the candidate's resume AND their company portfolio.
+
+Consider:
+1. Direct skills match from resume
+2. Relevant project experience from portfolio
+3. Industry alignment
+4. Seniority/experience level match
+5. Location compatibility
+
+Return JSON: {{"scores": [{{"id": N, "score": 0-100, "reasoning": "...", "portfolio_relevance": "which portfolio projects are relevant"}}]}}
 
 Scoring guide:
 - 90-100: Excellent match, candidate is highly qualified
@@ -206,7 +345,7 @@ Scoring guide:
 - 30-49: Weak match, limited relevance
 - 0-29: Poor match, significantly misaligned
 
-Be honest and calibrated. Consider skills, experience level, industry, and location.""",
+Be honest and calibrated.{portfolio_context}""",
                     },
                     {
                         "role": "user",
@@ -225,7 +364,11 @@ Jobs to score:
                 for job in batch:
                     if job.id == job_id:
                         job.fit_score = score_data.get("score", 0)
-                        job.fit_reasoning = score_data.get("reasoning", "")
+                        reasoning = score_data.get("reasoning", "")
+                        portfolio_rel = score_data.get("portfolio_relevance", "")
+                        if portfolio_rel:
+                            reasoning += f"\n\nPortfolio relevance: {portfolio_rel}"
+                        job.fit_reasoning = reasoning
                         job.status = "scored"
                         break
 
@@ -263,8 +406,22 @@ Jobs to score:
     )
 
 
+# ============================================================================
+# Phase 2: Document Preparation (RAG-Enhanced)
+# ============================================================================
+
 async def run_document_preparation(application_id: int, user_id: int):
-    """Phase 3: Generate tailored resume and cover letter for an application."""
+    """
+    Phase 2: Generate tailored resume and cover letter for an application.
+
+    Uses RAG to incorporate relevant context from:
+    - The candidate's full resume
+    - Portfolio case studies that match the job
+    """
+    rag = get_rag_service()
+    if not rag._loaded:
+        rag.load_documents()
+
     async with async_session() as db:
         # Load application with job
         result = await db.execute(
@@ -292,7 +449,15 @@ async def run_document_preparation(application_id: int, user_id: int):
             f"Preparing documents for: {job.title} at {job.company}",
         )
 
-        # Tailor resume
+        # Get RAG context for this specific job
+        await _notify(user_id, "Analyzing relevant experience from your documents...")
+        rag_context = rag.get_context_for_job(
+            job_description=job.description,
+            job_title=job.title,
+            company=job.company,
+        )
+
+        # Tailor resume with RAG context
         try:
             tailor = ResumeTailorService()
             tailored_data = tailor.tailor(
@@ -300,6 +465,7 @@ async def run_document_preparation(application_id: int, user_id: int):
                 job_description=job.description,
                 job_title=job.title,
                 company=job.company,
+                additional_context=rag_context,  # Pass RAG context
             )
 
             # Generate DOCX
@@ -315,7 +481,7 @@ async def run_document_preparation(application_id: int, user_id: int):
             await _notify(user_id, f"Resume tailoring error: {str(e)}")
             app.error_message = f"Resume tailoring failed: {str(e)}"
 
-        # Write cover letter
+        # Write cover letter with RAG context
         try:
             writer = CoverLetterWriter()
             letter_text = writer.write(
@@ -323,6 +489,7 @@ async def run_document_preparation(application_id: int, user_id: int):
                 job_title=job.title,
                 company=job.company,
                 job_description=job.description,
+                additional_context=rag_context,  # Pass RAG context
             )
 
             # Generate DOCX
@@ -347,6 +514,7 @@ async def run_document_preparation(application_id: int, user_id: int):
         # Update status
         if app.tailored_resume_path and app.cover_letter_path:
             app.status = "documents_ready"
+            job.status = "documents_ready"  # Update job status too
             await _notify(
                 user_id,
                 f"Documents ready for {job.title} at {job.company}. "
@@ -364,6 +532,7 @@ async def run_document_preparation(application_id: int, user_id: int):
             "application_update",
             {
                 "application_id": app.id,
+                "job_id": job.id,
                 "job_title": job.title,
                 "company": job.company,
                 "status": app.status,
@@ -371,8 +540,12 @@ async def run_document_preparation(application_id: int, user_id: int):
         )
 
 
+# ============================================================================
+# Phase 3: Form Filling
+# ============================================================================
+
 async def run_form_filling(application_id: int):
-    """Phase 4: Fill the application form in the browser."""
+    """Phase 3: Fill the application form in the browser."""
     async with async_session() as db:
         result = await db.execute(
             select(Application)
@@ -411,6 +584,7 @@ async def run_form_filling(application_id: int):
             app.form_data_json = fill_result
             if fill_result.get("status") == "filled":
                 app.status = "form_filled"
+                job.status = "form_filled"
                 needs_review = fill_result.get("needs_review", [])
                 msg = f"Application form filled for {job.title}."
                 if needs_review:
@@ -438,8 +612,81 @@ async def run_form_filling(application_id: int):
             "application_update",
             {
                 "application_id": app.id,
+                "job_id": job.id,
                 "job_title": job.title,
                 "company": job.company,
                 "status": app.status,
             },
         )
+
+
+# ============================================================================
+# Pipeline Runner: Process All Jobs Recursively
+# ============================================================================
+
+async def run_pipeline_for_approved_jobs(user_id: int):
+    """
+    Recursively process all approved jobs through the pipeline.
+
+    For each approved job:
+    1. Create application if not exists
+    2. Prepare documents
+    3. Fill application form
+    """
+    tracker = PipelineTracker(user_id)
+
+    async with async_session() as db:
+        # Get all approved jobs without applications
+        result = await db.execute(
+            select(JobListing)
+            .where(
+                and_(
+                    JobListing.user_id == user_id,
+                    JobListing.status == "approved",
+                )
+            )
+        )
+        approved_jobs = result.scalars().all()
+
+        if not approved_jobs:
+            await _notify(user_id, "No approved jobs to process")
+            return
+
+        await _notify(user_id, f"Processing {len(approved_jobs)} approved jobs...")
+
+        for job in approved_jobs:
+            # Check if application exists
+            app_result = await db.execute(
+                select(Application).where(Application.job_id == job.id)
+            )
+            app = app_result.scalar_one_or_none()
+
+            if not app:
+                # Create application
+                app = Application(
+                    job_id=job.id,
+                    user_id=user_id,
+                    status="pending",
+                )
+                db.add(app)
+                await db.commit()
+                await db.refresh(app)
+
+            # Process based on current status
+            if app.status == "pending":
+                await run_document_preparation(app.id, user_id)
+                await db.refresh(app)
+
+            if app.status == "documents_ready":
+                await run_form_filling(app.id)
+                await db.refresh(app)
+
+        # Final status report
+        status = await tracker.get_pipeline_status()
+        await tracker.notify_status("Pipeline processing complete", status)
+
+
+async def get_pipeline_status(user_id: int) -> dict:
+    """Get the current pipeline status for a user."""
+    tracker = PipelineTracker(user_id)
+    return await tracker.get_pipeline_status()

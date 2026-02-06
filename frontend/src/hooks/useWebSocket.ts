@@ -7,7 +7,7 @@ export function useWebSocket() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [statusUpdates, setStatusUpdates] = useState<WSMessage[]>([])
   const [latestStatus, setLatestStatus] = useState<Record<string, any>>({})
-  const reconnectTimeout = useRef<NodeJS.Timeout>()
+  const reconnectTimeout = useRef<ReturnType<typeof setTimeout>>()
 
   const connect = useCallback(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'

@@ -17,8 +17,40 @@ class ResumeTailorService:
         self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
         self.model = settings.OPENAI_MODEL
 
-    def tailor(self, resume_data: dict, job_description: str, job_title: str, company: str) -> dict:
-        """Use GPT to tailor resume content for a specific job."""
+    def tailor(
+        self,
+        resume_data: dict,
+        job_description: str,
+        job_title: str,
+        company: str,
+        additional_context: str = "",
+    ) -> dict:
+        """Use GPT to tailor resume content for a specific job.
+
+        Args:
+            resume_data: Parsed resume data dictionary
+            job_description: The job posting description
+            job_title: Target job title
+            company: Target company name
+            additional_context: Optional RAG-retrieved context (portfolio, projects, etc.)
+        """
+        # Build the user prompt with optional additional context
+        user_content = f"""Original resume data:
+{json.dumps(resume_data, indent=2)}
+
+Target job:
+Title: {job_title}
+Company: {company}
+Description: {job_description}"""
+
+        if additional_context:
+            user_content += f"""
+
+Additional context from candidate's portfolio/projects (use to enhance relevant sections):
+{additional_context}"""
+
+        user_content += "\n\nPlease tailor the resume for this specific job."
+
         response = self.client.chat.completions.create(
             model=self.model,
             response_format={"type": "json_object"},
@@ -35,21 +67,14 @@ Rules:
 5. Keep ALL information truthful — never fabricate experience or skills
 6. Optimize for ATS keyword matching
 7. Keep the same structure but improve relevance
+8. If additional context (portfolio/projects) is provided, incorporate relevant details that strengthen the application
 
 Return a JSON object with the SAME structure as the input resume data, but with tailored content.
 The JSON must include: full_name, email, phone, linkedin_url, summary, skills, experience, education, certifications.""",
                 },
                 {
                     "role": "user",
-                    "content": f"""Original resume data:
-{json.dumps(resume_data, indent=2)}
-
-Target job:
-Title: {job_title}
-Company: {company}
-Description: {job_description}
-
-Please tailor the resume for this specific job.""",
+                    "content": user_content,
                 },
             ],
         )

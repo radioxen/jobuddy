@@ -2,6 +2,7 @@ import asyncio
 from typing import Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright._impl._errors import TargetClosedError
 
 from app.config import settings
 
@@ -35,13 +36,48 @@ class BrowserManager:
         self._initialized = True
 
     async def ensure_initialized(self):
+        """Ensure browser is initialized, reinitializing if context was closed."""
         if not self._initialized:
             await self.initialize()
+            return
+
+        # Check if context is still valid
+        try:
+            # Try to access pages - will fail if context is closed
+            _ = self._context.pages
+        except Exception:
+            # Context was closed, reinitialize
+            self._initialized = False
+            self._context = None
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+            await self.initialize()
+
+    async def _reset_and_reinitialize(self):
+        """Reset state and reinitialize browser."""
+        self._initialized = False
+        self._context = None
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+        await self.initialize()
 
     async def new_page(self, url: Optional[str] = None) -> Page:
         """Open a new browser tab, optionally navigating to a URL."""
         await self.ensure_initialized()
-        page = await self._context.new_page()
+        try:
+            page = await self._context.new_page()
+        except TargetClosedError:
+            # Browser was closed, reinitialize
+            await self._reset_and_reinitialize()
+            page = await self._context.new_page()
         if url:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         return page
@@ -49,7 +85,11 @@ class BrowserManager:
     async def get_pages(self) -> list[Page]:
         """Get all open browser tabs."""
         await self.ensure_initialized()
-        return self._context.pages
+        try:
+            return self._context.pages
+        except TargetClosedError:
+            await self._reset_and_reinitialize()
+            return self._context.pages
 
     async def close_page(self, page: Page):
         """Close a specific browser tab."""

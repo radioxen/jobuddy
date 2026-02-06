@@ -22,8 +22,34 @@ class CoverLetterWriter:
         job_title: str,
         company: str,
         job_description: str,
+        additional_context: str = "",
     ) -> str:
-        """Generate a cover letter using GPT. Returns the letter text."""
+        """Generate a cover letter using GPT. Returns the letter text.
+
+        Args:
+            resume_data: Parsed resume data dictionary
+            job_title: Target job title
+            company: Target company name
+            job_description: The job posting description
+            additional_context: Optional RAG-retrieved context (portfolio, projects, etc.)
+        """
+        # Build the user prompt with optional additional context
+        user_content = f"""Candidate resume data:
+{json.dumps(resume_data, indent=2)}
+
+Target job:
+Title: {job_title}
+Company: {company}
+Description: {job_description}"""
+
+        if additional_context:
+            user_content += f"""
+
+Additional context from candidate's portfolio/projects (use to personalize the letter):
+{additional_context}"""
+
+        user_content += "\n\nWrite a cover letter for this specific job."
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -40,21 +66,14 @@ Rules:
 5. Close with enthusiasm and a call to action
 6. Be professional but authentic — avoid clichés and generic phrases
 7. Use a conversational yet professional tone
+8. If additional context (portfolio/projects) is provided, weave in relevant details that demonstrate expertise
 
 Format: Plain text paragraphs. Do NOT include the address header or date — just the letter body.
 Start directly with the salutation (Dear Hiring Manager,) and end with the sign-off.""",
                 },
                 {
                     "role": "user",
-                    "content": f"""Candidate resume data:
-{json.dumps(resume_data, indent=2)}
-
-Target job:
-Title: {job_title}
-Company: {company}
-Description: {job_description}
-
-Write a cover letter for this specific job.""",
+                    "content": user_content,
                 },
             ],
         )
